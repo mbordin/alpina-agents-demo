@@ -1,0 +1,15 @@
+# Allineato al sample ufficiale it-helpdesk-agent di WSO2 Agent Manager v1.0.0
+langchain>=1.3.0
+langchain-core>=1.4.9
+langchain-openai>=0.3.35
+langgraph>=0.5.0
+openai>=1.50.0
+requests>=2.32.0
+
+fastapi==0.139.0
+uvicorn[standard]==0.47.0
+pydantic==2.13.4
+
+# wrapt 1.x: l'auto-instrumentation di AM inietta opentelemetry-instrumentation-langchain
+# che usa wrap_function_wrapper(module=..., name=..., wrapper=...) (rimosso in wrapt 2.x)
+wrapt==1.17.3
