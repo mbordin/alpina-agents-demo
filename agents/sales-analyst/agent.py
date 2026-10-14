@@ -3,8 +3,9 @@
 * LLM: SEMPRE tramite l'AI Gateway di WSO2 Agent Manager. URL e chiave sono
   iniettati dalla piattaforma (LLM_PROVIDER_URL / LLM_PROVIDER_KEY) quando si
   associa un "LLM Service Provider" all'agente. Cambiare provider (OpenAI ->
-  Ollama -> ...) dalla console NON richiede modifiche al codice: il modello
-  viene scelto interrogando il gateway (/models).
+  Anthropic Claude e ritorno) dalla console NON richiede modifiche al codice:
+  il tipo di API (OpenAI o Anthropic) e il modello vengono riconosciuti da soli
+  (LLM_KIND=auto, default).
 * Dati: tool MCP dell'ERP, scoperti a runtime tramite l'MCP Proxy del gateway
   (ERP_MCP_URL). L'autorizzazione per-tool dipende dai ruoli AgentID.
 """
@@ -16,10 +17,10 @@ import os
 import threading
 from typing import Any, Optional
 
+from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_openai import ChatOpenAI
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.prebuilt import create_react_agent
-from openai import OpenAI
 
 from mcp_http import AgentIdTokenProvider, MCPHttpClient, build_langchain_tools
 
@@ -55,6 +56,7 @@ class AnalystRuntime:
         self._lock = threading.Lock()
         self._agent: Any = None
         self._model_name: Optional[str] = None
+        self._llm_kind: Optional[str] = None
         self.denials: list[dict[str, str]] = []
         self.memory = MemorySaver()
         self.token_provider: Optional[AgentIdTokenProvider] = None
@@ -71,29 +73,66 @@ class AnalystRuntime:
             )
         return url, key, header
 
-    def resolve_model(self) -> str:
-        """Usa LLM_MODEL se il provider lo offre, altrimenti il primo modello disponibile."""
-        wanted = os.environ.get("LLM_MODEL", "gpt-4o-mini")
-        preferred_local = os.environ.get("LOCAL_MODEL", "qwen2.5:7b")
-        url, key, header = self._llm_settings()
-        try:
-            client = OpenAI(base_url=url, api_key="unused", default_headers={header: key, "Authorization": ""}, timeout=10)
-            ids = [m.id for m in client.models.list().data]
-            if wanted in ids:
-                return wanted
-            if preferred_local in ids:
-                return preferred_local
-            if ids:
-                log.info("Modello %s non offerto dal provider; uso %s", wanted, ids[0])
-                return ids[0]
-        except Exception as exc:  # noqa: BLE001
-            log.info("Impossibile elencare i modelli via gateway (%s); uso %s", exc, wanted)
-        return wanted
+    def _list_models(self, url: str, key: str, header: str) -> list[str]:
+        """Elenca i modelli esposti dal gateway (API OpenAI /models o Anthropic /v1/models)."""
+        import requests
 
-    def _build_llm(self) -> ChatOpenAI:
+        headers = {header: key, "anthropic-version": "2023-06-01"}
+        for path in ("/models", "/v1/models"):
+            try:
+                r = requests.get(url + path, headers=headers, timeout=10)
+                if r.ok:
+                    ids = [m.get("id") for m in r.json().get("data", []) if m.get("id")]
+                    if ids:
+                        return ids
+            except Exception as exc:  # noqa: BLE001
+                log.debug("GET %s%s fallita: %s", url, path, exc)
+        return []
+
+    def resolve_llm(self) -> tuple[str, str]:
+        """Restituisce (tipo, modello). tipo = 'openai' | 'anthropic'.
+
+        Ordine: LLM_KIND esplicito -> modelli offerti dal gateway -> indizi nell'URL -> openai.
+        Il modello: LLM_MODEL (OpenAI) o ANTHROPIC_MODEL (Claude) se offerti, altrimenti il primo disponibile.
+        """
         url, key, header = self._llm_settings()
-        self._model_name = self.resolve_model()
-        log.info("LLM via AI Gateway: %s (modello %s)", url, self._model_name)
+        kind = os.environ.get("LLM_KIND", "auto").strip().lower()
+        openai_model = os.environ.get("LLM_MODEL", "gpt-4o-mini")
+        claude_model = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-5")
+        ids = self._list_models(url, key, header)
+        if kind not in ("openai", "anthropic"):
+            if ids:
+                kind = "anthropic" if any(i.startswith("claude") for i in ids) and not any(i.startswith("gpt") for i in ids) else "openai"
+            elif any(h in url.lower() for h in ("anthropic", "claude")):
+                kind = "anthropic"
+            else:
+                kind = "openai"
+        wanted = claude_model if kind == "anthropic" else openai_model
+        if ids and wanted not in ids:
+            family = "claude" if kind == "anthropic" else "gpt"
+            pick = next((i for i in ids if i.startswith(family)), ids[0])
+            log.info("Modello %s non offerto dal provider; uso %s", wanted, pick)
+            wanted = pick
+        return kind, wanted
+
+    def _build_llm(self) -> BaseChatModel:
+        url, key, header = self._llm_settings()
+        kind, self._model_name = self.resolve_llm()
+        self._llm_kind = kind
+        log.info("LLM via AI Gateway: %s (API %s, modello %s)", url, kind, self._model_name)
+        if kind == "anthropic":
+            from langchain_anthropic import ChatAnthropic
+
+            return ChatAnthropic(
+                model=self._model_name,
+                temperature=0,
+                max_tokens=2000,
+                base_url=url,
+                api_key="unused-key-held-by-gateway",
+                default_headers={header: key},
+                timeout=120,
+                max_retries=1,
+            )
         return ChatOpenAI(
             model=self._model_name,
             temperature=0,
@@ -138,6 +177,7 @@ class AnalystRuntime:
     def info(self) -> dict[str, Any]:
         return {
             "model": self._model_name,
+            "llm_api": self._llm_kind,
             "llm_gateway_url": os.environ.get("LLM_PROVIDER_URL"),
             "mcp_url": os.environ.get("ERP_MCP_URL"),
             "agentid_client_id": os.environ.get("AMP_AGENTID_CLIENT_ID"),
